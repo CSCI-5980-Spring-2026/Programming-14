@@ -102,7 +102,7 @@ std::shared_ptr<Node> MainLoopTest::create_sphere_node(float radius) {
 // This means the OpenGL context is not yet available. It should be used for initial configuration.
 void MainLoopTest::configure() {
 
-	window_.set_title("CSCI 5980 Programming 13");
+	window_.set_title("CSCI 5980 Programming 14");
 	window_.set_vertical_sync(true);
 	window_.set_framerate_limit(60);
 	renderer_.set_background_color(glm::vec4(0.5f, 0.75f, .9f, 1.f));
