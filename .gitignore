@@ -1,0 +1,11 @@
+build
+out
+resources
+bin
+.cache
+.idea
+.vs
+.claude
+.codex
+AGENTS.md
+CLAUDE.md
