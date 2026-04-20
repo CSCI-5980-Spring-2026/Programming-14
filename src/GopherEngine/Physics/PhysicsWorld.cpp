@@ -6,7 +6,7 @@
 
 #include <glm/gtc/quaternion.hpp>
 
-#include <btBulletCollisionCommon.h>
+#include <btBulletDynamicsCommon.h>
 
 #include <algorithm>
 #include <memory>
@@ -59,6 +59,20 @@ namespace
         return btVector3(vector.x, vector.y, vector.z);
     }
 
+    void apply_bullet_transform_to_node(const btTransform& transform, GopherEngine::Node& node)
+    {
+        auto& node_transform = node.transform();
+
+        const btVector3 origin = transform.getOrigin();
+        node_transform.position_ = glm::vec3(origin.x(), origin.y(), origin.z());
+
+        const btQuaternion rotation = transform.getRotation();
+        node_transform.rotation_ = glm::normalize(glm::quat(
+            rotation.w(),
+            rotation.x(),
+            rotation.y(),
+            rotation.z()));
+    }
 }
 
 namespace GopherEngine
@@ -70,15 +84,17 @@ namespace GopherEngine
         collision_configuration_ = std::make_unique<btDefaultCollisionConfiguration>();
         dispatcher_ = std::make_unique<btCollisionDispatcher>(collision_configuration_.get());
         broadphase_ = std::make_unique<btDbvtBroadphase>();
-        collision_world_ = std::make_unique<btCollisionWorld>(
+        solver_ = std::make_unique<btSequentialImpulseConstraintSolver>();
+        dynamics_world_ = std::make_unique<btDiscreteDynamicsWorld>(
             dispatcher_.get(),
             broadphase_.get(),
+            solver_.get(),
             collision_configuration_.get());
     }
 
     PhysicsWorld::~PhysicsWorld() = default;
 
-    void PhysicsWorld::update()
+    void PhysicsWorld::update(float delta_time)
     {
         // Start each frame with a fresh list of overlap pairs.
         collision_pairs_.clear();
@@ -87,8 +103,8 @@ namespace GopherEngine
         {
             // Clear each collider's cached overlap list before detecting the
             // current frame's overlaps.
-            if (entry.component_ != nullptr)
-                entry.component_->overlapping_colliders_.clear();
+            if (entry.collider_component_ != nullptr)
+                entry.collider_component_->overlapping_colliders_.clear();
 
             // Skip incomplete entries rather than crashing; this keeps the
             // wrapper tolerant of registration teardown edge cases.
@@ -100,8 +116,20 @@ namespace GopherEngine
             entry.object_->setWorldTransform(to_bullet_transform(entry.owner_node_->world_matrix()));
         }
 
-        // Ask Bullet to detect all overlaps for the current object transforms.
-        collision_world_->performDiscreteCollisionDetection();
+        // Advance the dynamics world for this frame.
+        dynamics_world_->stepSimulation(delta_time, 1);
+
+        // Copy simulated transforms back into engine nodes. MainLoop will
+        // rebuild matrices afterward using the updated node transforms.
+        for (auto& [collider_id, entry] : colliders_)
+        {
+            if (!entry.rigid_body_component_ || entry.owner_node_ == nullptr || entry.object_ == nullptr)
+                continue;
+
+            // Copy the simulated transform back into the engine node.
+            if (auto* rigid_body = btRigidBody::upcast(entry.object_.get()))
+                apply_bullet_transform_to_node(rigid_body->getWorldTransform(), *entry.owner_node_);
+        }
 
         const int manifold_count = dispatcher_->getNumManifolds();
 
@@ -149,12 +177,12 @@ namespace GopherEngine
 
             // Mark both colliders as colliding so component-side queries stay simple.
             if (auto collider_it = colliders_.find(collider_a); collider_it != colliders_.end() &&
-                collider_it->second.component_ != nullptr)
-                collider_it->second.component_->overlapping_colliders_.push_back(collider_b);
+                collider_it->second.collider_component_ != nullptr)
+                collider_it->second.collider_component_->overlapping_colliders_.push_back(collider_b);
 
             if (auto collider_it = colliders_.find(collider_b); collider_it != colliders_.end() &&
-                collider_it->second.component_ != nullptr)
-                collider_it->second.component_->overlapping_colliders_.push_back(collider_a);
+                collider_it->second.collider_component_ != nullptr)
+                collider_it->second.collider_component_->overlapping_colliders_.push_back(collider_a);
         }
     }
 
@@ -178,7 +206,7 @@ namespace GopherEngine
         if (collider_it == colliders_.end())
             return nullptr;
 
-        return collider_it->second.component_;
+        return collider_it->second.collider_component_;
     }
 
     ColliderId PhysicsWorld::register_sphere_collider(ColliderComponent* component, Node& node, float radius)
@@ -214,17 +242,27 @@ namespace GopherEngine
             return;
 
         // Clear the overlap list so stale state is not left behind on the component.
-        if (collider_it->second.component_ != nullptr)
-            collider_it->second.component_->overlapping_colliders_.clear();
+        if (collider_it->second.collider_component_ != nullptr)
+            collider_it->second.collider_component_->overlapping_colliders_.clear();
 
-        if (collider_it->second.object_ != nullptr)
-        {
-            // Remove the object from Bullet before destroying our local ownership.
-            collision_world_->removeCollisionObject(collider_it->second.object_.get());
-        }
+        auto& entry = collider_it->second;
 
-        // Erasing the entry releases both the shape and the collision object.
-        colliders_.erase(collider_it);
+        // Remove the Bullet object before stripping collider state. A rigid body
+        // without a collision shape is not a meaningful teaching example here,
+        // so the Bullet-side object must disappear until a collider is added back.
+        if (entry.object_ != nullptr)
+            remove_collision_object(entry);
+
+        // Clear only the collider-owned data. If a rigid body component still
+        // exists, we keep the entry as a pending record so re-adding a collider
+        // later can reconstruct the Bullet object without losing the shared id.
+        entry.collider_component_ = nullptr;
+        entry.shape_.reset();
+
+        // If the rigid body is also gone, nothing owns this entry anymore and it
+        // can be removed from both registries.
+        if (entry.rigid_body_component_ == nullptr)
+            colliders_.erase(collider_it);
     }
 
     ColliderId PhysicsWorld::register_collider(
@@ -235,38 +273,180 @@ namespace GopherEngine
         if (component == nullptr)
             throw std::invalid_argument("Collider registration requires a valid component");
 
-        // Allocate a new engine-facing id for this collider.
-        const ColliderId collider_id = next_collider_id_++;
+        const ColliderId collider_id = get_or_create_entry_id(node);
+        auto& entry = colliders_.at(collider_id);
 
-        // Build the Bullet collision object and attach the shape created by the
-        // public registration helper.
-        auto object = std::make_unique<btCollisionObject>();
-        object->setCollisionShape(shape.get());
-        object->setWorldTransform(to_bullet_transform(node.world_matrix()));
-        object->setUserIndex(static_cast<int>(collider_id));
+         if (entry.collider_component_ != nullptr)
+            throw std::invalid_argument("Only one ColliderComponent is supported per node");
 
-        // Insert the object into Bullet so it participates in overlap testing.
-        collision_world_->addCollisionObject(object.get());
+        // Store the collider-owned state on the shared node entry first. If a
+        // rigid body was registered earlier, this fills in the missing shape and
+        // lets us finish the Bullet-side object construction now.
+        entry.shape_ = std::move(shape);
+        entry.owner_node_ = &node;
+        entry.collider_component_ = component;
 
-        // Store the shape, object, and engine back-pointers together in one registry entry.
-        colliders_[collider_id] = ColliderEntry{
-            std::move(shape),
-            std::move(object),
-            &node,
-            component
-        };
+        // Remove any stale Bullet object before rebuilding the node's physics
+        // representation. This is most commonly a collision-only object that is
+        // about to be replaced by a rigid body because the rigid body component
+        // was registered earlier.
+        if (entry.object_ != nullptr)
+            remove_collision_object(entry);
+
+        // If the node also has a rigid body component, complete the entry as a
+        // dynamic rigid body. Otherwise, register the simpler collision-only
+        // object used for overlap testing.
+        if (entry.rigid_body_component_)
+        {
+            auto rigid_body = build_rigid_body(collider_id, entry);
+            dynamics_world_->addRigidBody(rigid_body.get());
+            entry.object_ = std::move(rigid_body);
+            return collider_id;
+        }
+
+        auto object = build_collision_object(collider_id, entry);
+        dynamics_world_->addCollisionObject(object.get());
+        entry.object_ = std::move(object);
 
         return collider_id;
     }
 
      ColliderId PhysicsWorld::register_rigid_body(RigidBodyComponent* component, Node& node)
      {
-        const ColliderId collider_id = 0;
+        if (component == nullptr)
+            throw std::invalid_argument("Rigid body registration requires a valid component");
+        if (component->get_mass() <= 0.f)
+            throw std::invalid_argument("RigidBodyComponent mass must be greater than zero");
+
+        // Get or create the collider entry id
+        const ColliderId collider_id = get_or_create_entry_id(node);
+        auto& entry = colliders_.at(collider_id);
+
+        if(entry.rigid_body_component_ != nullptr)
+            throw std::invalid_argument("Only one RigidBodyComponent is supported per node");
+
+        // Store the rigid body authoring data on the shared node entry first.
+        // This is what makes registration order-independent: if the collider has
+        // not been added yet, we still remember that the node wants to become a
+        // dynamic rigid body once a collision shape exists.
+        entry.rigid_body_component_ = component;
+
+        // If a collision-only object already exists for this node, remove it
+        // before building the rigid body. Bullet objects cannot change their
+        // concrete type in place, so we must tear down the old object and then
+        // create the new rigid-body representation explicitly.
+        if (entry.object_ != nullptr)
+            remove_collision_object(entry);
+
+        // The collider's shape already exists, so we can now construct the
+        // Bullet rigid body that will own mass and velocity state.
+        auto rigid_body = build_rigid_body(collider_id, entry);
+        dynamics_world_->addRigidBody(rigid_body.get());
+        entry.object_ = std::move(rigid_body);
         return collider_id;
      }
 
      void PhysicsWorld::unregister_rigid_body(ColliderId collider_id)
      {
+        const auto collider_it = colliders_.find(collider_id);
+        if (collider_it == colliders_.end())
+            return;
 
+        auto& entry = collider_it->second;
+        if (entry.rigid_body_component_ == nullptr)
+            return;
+
+        // If a Bullet object exists, remove it before changing the entry's role.
+        // This is important for both complete entries and partially torn-down
+        // ones: Bullet must not keep simulating an object whose engine-side
+        // ownership has been removed.
+        if (entry.object_ != nullptr)
+            remove_collision_object(entry);
+
+        // When the collider is still present, recreate the simpler collision-only
+        // representation. This keeps overlap queries working after the rigid body
+        // component has been removed.
+        if (entry.collider_component_ != nullptr && entry.shape_ != nullptr && entry.owner_node_ != nullptr)
+        {
+            auto object = build_collision_object(collider_id, entry);
+            dynamics_world_->addCollisionObject(object.get());
+            entry.object_ = std::move(object);
+            return;
+        }
+
+        // If neither component remains, the shared node entry is no longer useful.
+        // Erasing the registry entry ensures a future component addition will
+        // start with a fresh id and a fresh registry record.
+        if (entry.collider_component_ == nullptr)
+            colliders_.erase(collider_it);
      }
+
+     ColliderId PhysicsWorld::get_or_create_entry_id(Node& node)
+    {
+        // The registry entry already stores its owning node pointer, so we can
+        // recover an existing entry by scanning the registry directly. That keeps
+        // the data model smaller and avoids maintaining a second map that mirrors
+        // information already present in colliders_.
+        for (const auto& [collider_id, entry] : colliders_)
+        {
+            if (entry.owner_node_ == &node)
+                return collider_id;
+        }
+
+        const ColliderId collider_id = next_collider_id_++;
+        colliders_.emplace(collider_id, ColliderEntry{});
+        colliders_.at(collider_id).owner_node_ = &node;
+        return collider_id;
+    }
+
+    void PhysicsWorld::remove_collision_object(ColliderEntry& entry)
+    {
+        if (entry.object_ == nullptr)
+            return;
+
+        if (auto* rigid_body = btRigidBody::upcast(entry.object_.get()))
+            dynamics_world_->removeRigidBody(rigid_body);
+        else
+            dynamics_world_->removeCollisionObject(entry.object_.get());
+
+        entry.object_.reset();
+    }
+
+    std::unique_ptr<btRigidBody> PhysicsWorld::build_rigid_body(ColliderId collider_id, const ColliderEntry& entry) const
+    {
+        if (entry.shape_ == nullptr || entry.owner_node_ == nullptr)
+            throw std::runtime_error("Cannot build a rigid body without a collision shape and owner node");
+
+         // This helper does one narrow job: construct a rigid body from the entry
+        // data that has already been validated by the calling method. It does not
+        // remove old Bullet objects or insert the new one into the world.
+        btVector3 local_inertia(0.f, 0.f, 0.f);
+        entry.shape_->calculateLocalInertia(entry.rigid_body_component_->get_mass(), local_inertia);
+
+        btRigidBody::btRigidBodyConstructionInfo construction_info(
+            entry.rigid_body_component_->get_mass(),
+            nullptr,
+            entry.shape_.get(),
+            local_inertia);
+
+        auto rigid_body = std::make_unique<btRigidBody>(construction_info);
+        rigid_body->setWorldTransform(to_bullet_transform(entry.owner_node_->world_matrix()));
+        rigid_body->setUserIndex(static_cast<int>(collider_id));
+        return rigid_body;
+    }
+
+    std::unique_ptr<btCollisionObject> PhysicsWorld::build_collision_object(ColliderId collider_id, const ColliderEntry& entry) const
+    {
+        if (entry.shape_ == nullptr || entry.owner_node_ == nullptr)
+            throw std::runtime_error("Cannot build a collision object without a collision shape and owner node");
+
+        // This helper is the collision-only counterpart to build_rigid_body().
+        // It constructs the Bullet object from the current entry state, while the
+        // caller remains responsible for lifecycle and world-registration steps.
+        auto object = std::make_unique<btCollisionObject>();
+        object->setCollisionShape(entry.shape_.get());
+        object->setWorldTransform(to_bullet_transform(entry.owner_node_->world_matrix()));
+        object->setUserIndex(static_cast<int>(collider_id));
+        return object;
+    }
 }

@@ -17,7 +17,9 @@ class btCollisionConfiguration;
 class btCollisionDispatcher;
 class btCollisionObject;
 class btCollisionShape;
-class btCollisionWorld;
+class btConstraintSolver;
+class btDiscreteDynamicsWorld;
+class btRigidBody;
 
 namespace GopherEngine
 {
@@ -50,7 +52,7 @@ namespace GopherEngine
 
             // Synchronizes engine transforms into Bullet, runs collision detection,
             // and caches the overlap results for later queries this frame.
-            void update();
+            void update(float delta_time);
 
             // Returns the list of overlap pairs recorded during the last update().
             const std::vector<CollisionPair>& get_collision_pairs() const;
@@ -93,7 +95,7 @@ namespace GopherEngine
                 Node* owner_node_{nullptr};
 
                 // Points back at the engine component so collision flags can be updated.
-                ColliderComponent* component_{nullptr};
+                ColliderComponent* collider_component_{nullptr};
 
                 // Points back at the rigid body component if one is registered.
                 RigidBodyComponent* rigid_body_component_{nullptr};
@@ -105,6 +107,28 @@ namespace GopherEngine
                 Node& node,
                 std::unique_ptr<btCollisionShape> shape);
 
+            // Looks up or allocates the shared physics entry for a node.
+            ColliderId get_or_create_entry_id(Node& node);
+
+            // Removes whichever Bullet object is currently stored in the entry
+            // and clears the local ownership pointer. This helper is narrow and
+            // mechanical, so it improves readability without hiding the higher-
+            // level registration state transitions from students.
+            void remove_collision_object(ColliderEntry& entry);
+
+            // Builds a Bullet rigid body using the fully populated data already
+            // stored in a collider entry. This helper only constructs the
+            // object; callers still decide when to remove old objects, insert
+            // the new one into the world, and store ownership in the entry.
+            std::unique_ptr<btRigidBody> build_rigid_body(ColliderId collider_id, const ColliderEntry& entry) const;
+
+            // Builds a plain Bullet collision object using the fully populated
+            // collider state already stored in an entry. Like build_rigid_body(),
+            // this helper only constructs the object and leaves lifecycle
+            // decisions to the calling register/unregister method.
+            std::unique_ptr<btCollisionObject> build_collision_object(ColliderId collider_id, const ColliderEntry& entry) const;
+
+
             // Bullet object that stores low-level collision settings and factories.
             std::unique_ptr<btCollisionConfiguration> collision_configuration_;
 
@@ -114,8 +138,11 @@ namespace GopherEngine
             // Bullet broadphase acceleration structure used to prune likely pairs.
             std::unique_ptr<btBroadphaseInterface> broadphase_;
 
+            // Bullet solver used to resolve rigid-body constraints and contacts.
+            std::unique_ptr<btConstraintSolver> solver_;
+
             // The collision-only Bullet world used in this assignment.
-            std::unique_ptr<btCollisionWorld> collision_world_;
+            std::unique_ptr<btDiscreteDynamicsWorld> dynamics_world_;
 
             // Maps engine collider ids to the Bullet objects and engine pointers they own.
             std::unordered_map<ColliderId, ColliderEntry> colliders_;

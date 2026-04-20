@@ -15,6 +15,7 @@
 #include <GopherEngine/Resource/MeshFactory.hpp>
 #include <GopherEngine/Physics/BoxColliderComponent.hpp>
 #include <GopherEngine/Physics/SphereColliderComponent.hpp>
+#include <GopherEngine/Physics/RigidBodyComponent.hpp>
 using namespace GopherEngine;
 
 #include <glm/gtc/constants.hpp>
@@ -167,7 +168,24 @@ void MainLoopTest::update(float delta_time) {
 }
 
 void MainLoopTest::on_key_press(const KeyEvent& event) {
-	
+	constexpr glm::vec3 spawn_position(0.f, 15.f, 0.f);
+
+	if (event.key == Key::Num1) {
+		auto sphere_node = create_sphere_node(0.5f + Random::value());
+		sphere_node->transform().position_ = spawn_position;
+		scene_->add_node(sphere_node);
+		sphere_node->add_component(make_shared<RigidBodyComponent>(1.f));
+	}
+	else if (event.key == Key::Num2) {
+		auto cube_node = create_cube_node(glm::vec3(
+			1.f + Random::value() * 2.f,
+			1.f + Random::value() * 2.f,
+			1.f + Random::value() * 2.f
+		));
+		cube_node->transform().position_ = spawn_position;
+		scene_->add_node(cube_node);
+		cube_node->add_component(make_shared<RigidBodyComponent>(1.f));
+	}
 }
 
 
